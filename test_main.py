@@ -839,6 +839,146 @@ class TestExportAuditEvents:
 
 
 # ---------------------------------------------------------------------------
+# API integration tests: GET /audit/reports/compliance-access (Scenario C)
+# ---------------------------------------------------------------------------
+
+
+class TestComplianceAccessReport:
+    def _params(self, **overrides):
+        params = {
+            "resource_id": "acct-1",
+            "from_ts": "2020-01-01T00:00:00Z",
+            "to_ts": "2020-12-31T23:59:59Z",
+        }
+        params.update(overrides)
+        return params
+
+    def test_filters_by_resource_id(self, isolated_db, client):
+        _seed_chain(
+            [
+                {"timestamp": "2020-06-01T00:00:00Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1"},
+                {"timestamp": "2020-06-01T00:00:01Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-2"},
+            ]
+        )
+        body = client.get("/audit/reports/compliance-access", params=self._params()).json()
+        assert body["event_count"] == 1
+        assert body["events"][0]["resource_id"] == "acct-1"
+
+    def test_only_includes_the_fixed_access_event_types(self, isolated_db, client):
+        _seed_chain(
+            [
+                {"timestamp": "2020-06-01T00:00:00Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1"},
+                {"timestamp": "2020-06-01T00:00:01Z", "event_type": "RECORD_UPDATED", "resource_id": "acct-1"},
+                {"timestamp": "2020-06-01T00:00:02Z", "event_type": "DATA_EXPORT", "resource_id": "acct-1"},
+                {"timestamp": "2020-06-01T00:00:03Z", "event_type": "LOGIN", "resource_id": "acct-1"},
+            ]
+        )
+        body = client.get("/audit/reports/compliance-access", params=self._params()).json()
+        assert body["event_count"] == 3
+        assert all(e["event_type"] != "LOGIN" for e in body["events"])
+
+    def test_filters_by_time_window(self, isolated_db, client):
+        _seed_chain(
+            [
+                {"timestamp": "2019-12-31T23:59:59Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1"},
+                {"timestamp": "2020-06-01T00:00:00Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1"},
+                {"timestamp": "2021-01-01T00:00:00Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1"},
+            ]
+        )
+        body = client.get("/audit/reports/compliance-access", params=self._params()).json()
+        assert body["event_count"] == 1
+        assert body["events"][0]["timestamp"] == "2020-06-01T00:00:00Z"
+
+    def test_unique_actors_are_deduped_and_sorted(self, isolated_db, client):
+        _seed_chain(
+            [
+                {"timestamp": "2020-06-01T00:00:00Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1", "actor_id": "bob"},
+                {"timestamp": "2020-06-01T00:00:01Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1", "actor_id": "alice"},
+                {"timestamp": "2020-06-01T00:00:02Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1", "actor_id": "bob"},
+            ]
+        )
+        body = client.get("/audit/reports/compliance-access", params=self._params()).json()
+        assert body["unique_actor_count"] == 2
+        assert body["unique_actors"] == ["alice", "bob"]
+
+    def test_access_frequency_counts_each_event_type_including_zero(self, isolated_db, client):
+        _seed_chain(
+            [
+                {"timestamp": "2020-06-01T00:00:00Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1"},
+                {"timestamp": "2020-06-01T00:00:01Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1"},
+                {"timestamp": "2020-06-01T00:00:02Z", "event_type": "RECORD_UPDATED", "resource_id": "acct-1"},
+            ]
+        )
+        body = client.get("/audit/reports/compliance-access", params=self._params()).json()
+        assert body["access_frequency_by_event_type"] == {
+            "ACCOUNT_READ": 2,
+            "RECORD_UPDATED": 1,
+            "DATA_EXPORT": 0,
+        }
+
+    def test_events_are_chronological(self, isolated_db, client):
+        _seed_chain(
+            [
+                {"timestamp": "2020-06-03T00:00:00Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1"},
+                {"timestamp": "2020-06-01T00:00:00Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1"},
+                {"timestamp": "2020-06-02T00:00:00Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1"},
+            ]
+        )
+        body = client.get("/audit/reports/compliance-access", params=self._params()).json()
+        timestamps = [e["timestamp"] for e in body["events"]]
+        assert timestamps == sorted(timestamps)
+
+    def test_verification_proof_is_intact_for_an_untampered_log(self, isolated_db, client):
+        records = _seed_chain(
+            [
+                {"timestamp": "2020-06-01T00:00:00Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1"},
+                {"timestamp": "2020-06-02T00:00:00Z", "event_type": "DATA_EXPORT", "resource_id": "acct-1"},
+            ]
+        )
+        body = client.get("/audit/reports/compliance-access", params=self._params()).json()
+        proof = body["verification_proof"]
+        assert proof["chain_status"] == "INTACT"
+        assert proof["bounding_start_hash"] == records[0]["prev_hash"]
+        assert proof["bounding_end_hash"] == records[-1]["record_hash"]
+
+    def test_chain_status_reflects_the_whole_log_not_just_this_account(self, isolated_db, client):
+        """A tampered record for a DIFFERENT account must still flip chain_status
+        to BROKEN, since the proof attests to the whole log's integrity, not
+        just the events included in this particular report.
+        """
+        _seed_chain([{"timestamp": "2020-06-01T00:00:00Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-1"}])
+        other = _seed_chain(
+            [{"timestamp": "2020-06-01T00:00:01Z", "event_type": "ACCOUNT_READ", "resource_id": "acct-2"}]
+        )[0]
+
+        conn = database.get_connection()
+        try:
+            conn.execute("UPDATE audit_events SET payload = '{\"tampered\":true}' WHERE id = ?", (other["id"],))
+            conn.commit()
+        finally:
+            conn.close()
+
+        body = client.get("/audit/reports/compliance-access", params=self._params()).json()
+        assert body["event_count"] == 1  # acct-1's own events are unaffected
+        assert body["verification_proof"]["chain_status"] == "BROKEN"
+
+    def test_no_matching_events_returns_empty_report(self, client):
+        body = client.get("/audit/reports/compliance-access", params=self._params(resource_id="nobody-home")).json()
+        assert body["event_count"] == 0
+        assert body["unique_actors"] == []
+        assert body["access_frequency_by_event_type"] == {"ACCOUNT_READ": 0, "RECORD_UPDATED": 0, "DATA_EXPORT": 0}
+        assert body["verification_proof"]["bounding_start_hash"] is None
+        assert body["verification_proof"]["bounding_end_hash"] is None
+
+    @pytest.mark.parametrize("missing_param", ["resource_id", "from_ts", "to_ts"])
+    def test_missing_required_param_is_rejected(self, client, missing_param):
+        params = self._params()
+        del params[missing_param]
+        resp = client.get("/audit/reports/compliance-access", params=params)
+        assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
 # Unit tests: main.py cursor helpers
 # ---------------------------------------------------------------------------
 

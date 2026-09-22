@@ -10,6 +10,9 @@ Scenario B -- redaction, retention, and export on top of that log:
     POST /audit/retention/apply           -- archive events older than N days
     GET  /audit/export                    -- a self-contained, verifiable export
 
+Scenario C -- a compliance-facing report built on the Scenario B export engine:
+    GET  /audit/reports/compliance-access -- access history for one client account
+
 There is deliberately no *delete* endpoint, and no generic update
 endpoint. Every stored record is chained to its predecessor via
 `prev_hash`/`record_hash` (see crypto_utils.py), so mutating or
@@ -173,6 +176,28 @@ class ExportBundle(BaseModel):
     records: List[AuditEventResponse]
     export_metadata: ExportMetadata
     verification_proof: VerificationProof
+
+
+class ComplianceVerificationProof(BaseModel):
+    """Cryptographic proof that the report reflects an untampered log."""
+
+    bounding_start_hash: Optional[str] = None
+    bounding_end_hash: Optional[str] = None
+    chain_status: str
+
+
+class ComplianceAccessReport(BaseModel):
+    """A regulator/compliance-facing report of access to one client account."""
+
+    resource_id: str
+    from_ts: str
+    to_ts: str
+    event_count: int
+    unique_actor_count: int
+    unique_actors: List[str]
+    access_frequency_by_event_type: Dict[str, int]
+    events: List[AuditEventResponse]
+    verification_proof: ComplianceVerificationProof
 
 
 # ---------------------------------------------------------------------------
@@ -520,5 +545,64 @@ def export_audit_events(
                 )
                 for row in rows
             ],
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scenario C: compliance reporting
+# ---------------------------------------------------------------------------
+
+#: The fixed set of event types a compliance-access report covers. This is
+#: not client-configurable -- it is what "access" was scoped to mean for
+#: this report (see SCENARIO_C_COMPLIANCE_REPORTING.md).
+COMPLIANCE_ACCESS_EVENT_TYPES = ["ACCOUNT_READ", "RECORD_UPDATED", "DATA_EXPORT"]
+
+
+@app.get("/audit/reports/compliance-access", response_model=ComplianceAccessReport)
+def compliance_access_report(
+    resource_id: str,
+    from_ts: str,
+    to_ts: str,
+) -> ComplianceAccessReport:
+    """Report every access event for one client account within a UTC time window.
+
+    Covers `ACCOUNT_READ`, `RECORD_UPDATED`, and `DATA_EXPORT` events on
+    `resource_id`, between `from_ts` and `to_ts` inclusive. Built on the
+    same `export_events_by_target` engine as `GET /audit/export`
+    (Scenario B), so the `verification_proof` carries the same
+    `bounding_start_hash`/`bounding_end_hash` guarantee: `chain_status`
+    reports the *entire* log's chain health at request time, not just
+    this account's events, so a regulator knows the underlying audit
+    trail this report was drawn from was untampered.
+    """
+    export = export_events_by_target(
+        resource_id=resource_id,
+        event_types=COMPLIANCE_ACCESS_EVENT_TYPES,
+        from_ts=from_ts,
+        to_ts=to_ts,
+    )
+    rows = export["records"]
+
+    unique_actors = sorted({row["actor_id"] for row in rows})
+    frequency = {event_type: 0 for event_type in COMPLIANCE_ACCESS_EVENT_TYPES}
+    for row in rows:
+        frequency[row["event_type"]] += 1
+
+    chain_status = _run_chain_verification(get_all_events_ordered())
+
+    return ComplianceAccessReport(
+        resource_id=resource_id,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        event_count=len(rows),
+        unique_actor_count=len(unique_actors),
+        unique_actors=unique_actors,
+        access_frequency_by_event_type=frequency,
+        events=[_row_to_response(row) for row in rows],
+        verification_proof=ComplianceVerificationProof(
+            bounding_start_hash=export["bounding_start_hash"],
+            bounding_end_hash=export["bounding_end_hash"],
+            chain_status=chain_status.status,
         ),
     )

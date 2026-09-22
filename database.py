@@ -255,16 +255,23 @@ def archive_events_older_than(days: int) -> Dict[str, Any]:
 
 
 def export_events_by_target(
-    actor_id: Optional[str] = None, resource_id: Optional[str] = None
+    actor_id: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    event_types: Optional[List[str]] = None,
+    from_ts: Optional[str] = None,
+    to_ts: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Return every event matching `actor_id`/`resource_id`, oldest first, plus
+    """Return every event matching the given filters, oldest first, plus
     the chain hashes bounding that subset within the full log.
 
     The "bounding hashes" are the first matched record's `prev_hash`
     and the last matched record's `record_hash` -- the entry and exit
     points of this subset within the overall chain. They let a
     recipient anchor a partial export against the full log's structure
-    without needing every record in between.
+    without needing every record in between. This is the shared engine
+    behind both `GET /audit/export` and the compliance report endpoint
+    (`GET /audit/reports/compliance-access`), which additionally filters
+    by `event_types` and a `[from_ts, to_ts]` window.
     """
     clauses: List[str] = []
     params: List[Any] = []
@@ -274,6 +281,16 @@ def export_events_by_target(
     if resource_id is not None:
         clauses.append("resource_id = ?")
         params.append(resource_id)
+    if event_types:
+        placeholders = ",".join("?" for _ in event_types)
+        clauses.append(f"event_type IN ({placeholders})")
+        params.extend(event_types)
+    if from_ts is not None:
+        clauses.append("timestamp >= ?")
+        params.append(from_ts)
+    if to_ts is not None:
+        clauses.append("timestamp <= ?")
+        params.append(to_ts)
 
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = f"SELECT *, rowid FROM audit_events {where_sql} ORDER BY timestamp ASC, rowid ASC"
