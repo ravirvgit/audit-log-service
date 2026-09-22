@@ -79,6 +79,7 @@ def _build_record(
         "resource_type": resource_type,
         "resource_id": resource_id,
         "payload": payload,
+        "payload_hash": payload_hash,
         "timestamp": timestamp,
         "prev_hash": prev_hash,
         "record_hash": record_hash,
@@ -187,8 +188,8 @@ class TestDatabase:
             with pytest.raises(Exception):
                 conn.execute(
                     "INSERT INTO audit_events "
-                    "(id, event_type, actor_id, resource_type, resource_id, payload, timestamp, prev_hash, record_hash) "
-                    "VALUES (?, 'X', 'a', 'r', 'r1', 'not-json', '2020-01-01T00:00:00Z', 'GENESIS', 'h')",
+                    "(id, event_type, actor_id, resource_type, resource_id, payload, payload_hash, timestamp, prev_hash, record_hash) "
+                    "VALUES (?, 'X', 'a', 'r', 'r1', 'not-json', 'ph', '2020-01-01T00:00:00Z', 'GENESIS', 'h')",
                     (str(uuid.uuid4()),),
                 )
             conn.rollback()
@@ -202,8 +203,8 @@ class TestDatabase:
             with pytest.raises(Exception):
                 conn.execute(
                     "INSERT INTO audit_events "
-                    "(id, event_type, actor_id, resource_type, resource_id, payload, timestamp, prev_hash, record_hash) "
-                    "VALUES (?, 'X', 'a', 'r', 'r1', '[1,2,3]', '2020-01-01T00:00:00Z', 'GENESIS', 'h')",
+                    "(id, event_type, actor_id, resource_type, resource_id, payload, payload_hash, timestamp, prev_hash, record_hash) "
+                    "VALUES (?, 'X', 'a', 'r', 'r1', '[1,2,3]', 'ph', '2020-01-01T00:00:00Z', 'GENESIS', 'h')",
                     (str(uuid.uuid4()),),
                 )
             conn.rollback()
@@ -604,6 +605,237 @@ class TestVerifyChain:
         body = client.get("/audit/verify").json()
         assert body["status"] == "BROKEN"
         assert body["first_violation"]["record_id"] == records[1]["id"]
+
+
+# ---------------------------------------------------------------------------
+# API integration tests: POST /audit/events/{record_id}/redact
+# ---------------------------------------------------------------------------
+
+
+class TestRedactAuditEvent:
+    def _create(self, client, **payload_overrides):
+        payload = {"account_number": "123456", "ssn": "111-22-3333", "amount": 50}
+        payload.update(payload_overrides)
+        return client.post(
+            "/audit/events",
+            json={"event_type": "PAYMENT", "actor_id": "u1", "resource_type": "txn", "resource_id": "t1", "payload": payload},
+        ).json()
+
+    def test_redact_replaces_specified_fields_with_marker(self, client):
+        created = self._create(client)
+        resp = client.post(f"/audit/events/{created['id']}/redact", json={"fields": ["account_number", "ssn"]})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["payload"]["account_number"] == "[REDACTED]"
+        assert body["payload"]["ssn"] == "[REDACTED]"
+        assert body["payload"]["amount"] == 50
+        assert body["is_redacted"] is True
+
+    def test_redact_preserves_payload_hash_and_record_hash(self, client):
+        created = self._create(client)
+        resp = client.post(f"/audit/events/{created['id']}/redact", json={"fields": ["account_number"]}).json()
+        assert resp["payload_hash"] == created["payload_hash"]
+        assert resp["record_hash"] == created["record_hash"]
+
+    def test_redact_ignores_fields_not_present_in_payload(self, client):
+        created = self._create(client)
+        resp = client.post(
+            f"/audit/events/{created['id']}/redact", json={"fields": ["not_a_real_field"]}
+        ).json()
+        assert resp["payload"] == created["payload"]
+
+    def test_redact_nonexistent_record_returns_404(self, client):
+        resp = client.post("/audit/events/does-not-exist/redact", json={"fields": ["ssn"]})
+        assert resp.status_code == 404
+
+    def test_redact_rejects_empty_fields_list(self, client):
+        created = self._create(client)
+        resp = client.post(f"/audit/events/{created['id']}/redact", json={"fields": []})
+        assert resp.status_code == 422
+
+    def test_chain_stays_intact_after_redaction(self, client):
+        first = self._create(client)
+        client.post(f"/audit/events/{first['id']}/redact", json={"fields": ["account_number", "ssn"]})
+        # A second event chained on top of the (now redacted) first must still verify.
+        client.post(
+            "/audit/events",
+            json={"event_type": "PAYMENT", "actor_id": "u1", "resource_type": "txn", "resource_id": "t2", "payload": {"amount": 1}},
+        )
+        body = client.get("/audit/verify").json()
+        assert body == {"status": "INTACT", "total_records": 2, "first_violation": None}
+
+    def test_get_events_reflects_redacted_payload_and_flag(self, client):
+        created = self._create(client)
+        client.post(f"/audit/events/{created['id']}/redact", json={"fields": ["ssn"]})
+        body = client.get("/audit/events").json()
+        assert body["items"][0]["is_redacted"] is True
+        assert body["items"][0]["payload"]["ssn"] == "[REDACTED]"
+
+
+# ---------------------------------------------------------------------------
+# API integration tests: POST /audit/retention/apply
+# ---------------------------------------------------------------------------
+
+
+class TestRetentionApply:
+    def test_archives_events_older_than_cutoff(self, client, isolated_db):
+        _seed_chain(
+            [
+                {"timestamp": "2000-01-01T00:00:00Z"},
+                {"timestamp": "2099-01-01T00:00:00Z"},
+            ]
+        )
+        body = client.post("/audit/retention/apply", params={"days": 90}).json()
+        assert body["archived_count"] == 1
+
+        events = client.get("/audit/events").json()["items"]
+        archived = {item["timestamp"]: item["is_archived"] for item in events}
+        assert archived["2000-01-01T00:00:00Z"] is True
+        assert archived["2099-01-01T00:00:00Z"] is False
+
+    def test_is_idempotent_on_already_archived_events(self, client, isolated_db):
+        _seed_chain([{"timestamp": "2000-01-01T00:00:00Z"}])
+        first = client.post("/audit/retention/apply", params={"days": 0}).json()
+        second = client.post("/audit/retention/apply", params={"days": 0}).json()
+        assert first["archived_count"] == 1
+        assert second["archived_count"] == 0
+
+    def test_archived_events_remain_queryable_and_chain_verifies(self, client, isolated_db):
+        _seed_chain([{"timestamp": "2000-01-01T00:00:00Z"} for _ in range(3)])
+        client.post("/audit/retention/apply", params={"days": 0})
+
+        events = client.get("/audit/events").json()["items"]
+        assert len(events) == 3
+        assert all(item["is_archived"] for item in events)
+
+        body = client.get("/audit/verify").json()
+        assert body == {"status": "INTACT", "total_records": 3, "first_violation": None}
+
+    def test_rejects_negative_days(self, client):
+        resp = client.post("/audit/retention/apply", params={"days": -1})
+        assert resp.status_code == 422
+
+    def test_verify_does_not_detect_payload_tampering_on_archived_records(self, client, isolated_db):
+        """Documents a deliberate trade-off: once a record is archived, /audit/verify
+        trusts its stored payload_hash instead of recomputing from the live payload
+        (same as for redacted records), so direct payload tampering on an archived
+        record is no longer visible to chain verification -- only tampering with the
+        chain-linkage fields (prev_hash/record_hash) still is.
+        """
+        # A deterministic old timestamp (rather than the live server clock) keeps
+        # this test's "older than the cutoff" outcome independent of how fast the
+        # test happens to run.
+        seeded = _seed_chain([{"timestamp": "2000-01-01T00:00:00Z"}])
+        client.post("/audit/retention/apply", params={"days": 1})
+
+        conn = database.get_connection()
+        try:
+            conn.execute(
+                "UPDATE audit_events SET payload = '{\"tampered\":true}' WHERE id = ?", (seeded[0]["id"],)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        body = client.get("/audit/verify").json()
+        assert body == {"status": "INTACT", "total_records": 1, "first_violation": None}
+
+
+# ---------------------------------------------------------------------------
+# API integration tests: GET /audit/export
+# ---------------------------------------------------------------------------
+
+
+class TestExportAuditEvents:
+    def _create(self, client, actor_id, resource_id, **payload):
+        return client.post(
+            "/audit/events",
+            json={"event_type": "TEST", "actor_id": actor_id, "resource_type": "r", "resource_id": resource_id, "payload": payload or {"n": 1}},
+        ).json()
+
+    def test_filters_by_actor_id(self, client):
+        self._create(client, "alice", "r1")
+        self._create(client, "bob", "r2")
+        body = client.get("/audit/export", params={"actor_id": "alice"}).json()
+        assert len(body["records"]) == 1
+        assert body["records"][0]["actor_id"] == "alice"
+
+    def test_filters_by_resource_id(self, client):
+        self._create(client, "alice", "r1")
+        self._create(client, "alice", "r2")
+        body = client.get("/audit/export", params={"resource_id": "r2"}).json()
+        assert len(body["records"]) == 1
+        assert body["records"][0]["resource_id"] == "r2"
+
+    def test_no_filters_exports_everything(self, client):
+        self._create(client, "alice", "r1")
+        self._create(client, "bob", "r2")
+        body = client.get("/audit/export").json()
+        assert len(body["records"]) == 2
+
+    def test_metadata_reports_record_count_and_intact_status(self, client):
+        self._create(client, "alice", "r1")
+        self._create(client, "alice", "r1")
+        body = client.get("/audit/export", params={"actor_id": "alice"}).json()
+        assert body["export_metadata"]["record_count"] == 2
+        assert body["export_metadata"]["chain_verification_status"] == "INTACT"
+        assert ISO_TIMESTAMP_RE.match(body["export_metadata"]["exported_at"])
+
+    def test_metadata_status_reflects_whole_log_not_just_filtered_subset(self, client, isolated_db):
+        """A tampered record for a DIFFERENT actor must still flip the export's
+        chain_verification_status to BROKEN, since it reports on the whole log's
+        health, not just the filtered subset being exported.
+        """
+        self._create(client, "alice", "r1")
+        tampered = self._create(client, "bob", "r2")
+
+        conn = database.get_connection()
+        try:
+            conn.execute("UPDATE audit_events SET payload = '{\"tampered\":true}' WHERE id = ?", (tampered["id"],))
+            conn.commit()
+        finally:
+            conn.close()
+
+        body = client.get("/audit/export", params={"actor_id": "alice"}).json()
+        assert len(body["records"]) == 1  # subset export is unaffected
+        assert body["export_metadata"]["chain_verification_status"] == "BROKEN"
+
+    def test_verification_proof_records_are_independently_recomputable(self, client):
+        self._create(client, "alice", "r1")
+        self._create(client, "alice", "r1")
+        body = client.get("/audit/export", params={"actor_id": "alice"}).json()
+
+        proof_records = body["verification_proof"]["records"]
+        full_records = body["records"]
+        assert len(proof_records) == len(full_records) == 2
+
+        for proof, record in zip(proof_records, full_records):
+            recomputed = crypto_utils.compute_record_hash(
+                proof["prev_hash"],
+                record["id"],
+                record["event_type"],
+                record["actor_id"],
+                record["resource_type"],
+                record["resource_id"],
+                proof["payload_hash"],
+                record["timestamp"],
+            )
+            assert recomputed == proof["record_hash"]
+
+    def test_bounding_hashes_match_subset_entry_and_exit_points(self, client):
+        first = self._create(client, "alice", "r1")
+        second = self._create(client, "alice", "r1")
+        body = client.get("/audit/export", params={"actor_id": "alice"}).json()
+
+        assert body["verification_proof"]["bounding_start_hash"] == first["prev_hash"]
+        assert body["verification_proof"]["bounding_end_hash"] == second["record_hash"]
+        assert body["verification_proof"]["genesis_hash"] == database.GENESIS_HASH
+
+    def test_empty_result_has_no_bounding_hashes(self, client):
+        body = client.get("/audit/export", params={"actor_id": "nobody"}).json()
+        assert body["records"] == []
+        assert body["verification_proof"]["bounding_start_hash"] is None
+        assert body["verification_proof"]["bounding_end_hash"] is None
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,17 @@ Every audit record is bound to the one before it by including the
 previous record's hash as an input to its own hash. Tampering with any
 field of any record -- or deleting/reordering records -- changes the
 hashes of everything after it, which `GET /audit/verify` can detect.
+
+`payload_hash` is computed once, at ingestion, from the record's
+original payload, and is stored as its own column (see
+`database.insert_audit_event`) rather than only ever existing inside
+`record_hash`. `database.redact_event_payload` relies on this: it
+overwrites specific payload fields with "[REDACTED]" but leaves the
+stored `payload_hash` (and therefore `record_hash`) untouched, so a
+redacted or archived record's live payload will no longer hash to
+`payload_hash` -- that mismatch is expected, not tampering, and
+`GET /audit/verify` uses the stored `payload_hash` rather than
+recomputing it for any record with `is_redacted` or `is_archived` set.
 """
 
 import hashlib

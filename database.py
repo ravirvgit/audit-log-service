@@ -7,6 +7,7 @@ the audit trail is append-only, so the only write path exposed is
 
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 DB_PATH = "audit_log.db"
@@ -40,9 +41,13 @@ def init_db() -> None:
                 resource_type TEXT NOT NULL,
                 resource_id TEXT NOT NULL,
                 payload JSON NOT NULL CHECK (json_valid(payload) AND json_type(payload) = 'object'),
+                payload_hash TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 prev_hash TEXT NOT NULL,
-                record_hash TEXT NOT NULL
+                record_hash TEXT NOT NULL,
+                is_redacted BOOLEAN NOT NULL DEFAULT 0,
+                is_archived BOOLEAN NOT NULL DEFAULT 0,
+                archived_at TEXT
             )
             """
         )
@@ -88,14 +93,20 @@ def get_latest_record_hash() -> str:
 
 
 def insert_audit_event(record: Dict[str, Any]) -> None:
-    """Append one fully-formed audit record. This is the only write path into the table."""
+    """Append one fully-formed audit record. This is the only write path into the table.
+
+    `payload_hash` is stored explicitly (not just embedded in
+    `record_hash`) so that a later redaction can overwrite `payload`
+    while leaving this original commitment -- and therefore
+    `record_hash` -- intact.
+    """
     with get_connection() as conn:
         conn.execute(
             """
             INSERT INTO audit_events
                 (id, event_type, actor_id, resource_type, resource_id,
-                 payload, timestamp, prev_hash, record_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 payload, payload_hash, timestamp, prev_hash, record_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record["id"],
@@ -104,6 +115,7 @@ def insert_audit_event(record: Dict[str, Any]) -> None:
                 record["resource_type"],
                 record["resource_id"],
                 json.dumps(record["payload"], sort_keys=True, separators=(",", ":"), default=str),
+                record["payload_hash"],
                 record["timestamp"],
                 record["prev_hash"],
                 record["record_hash"],
@@ -182,3 +194,95 @@ def get_all_events_ordered() -> List[sqlite3.Row]:
         return conn.execute(
             "SELECT *, rowid FROM audit_events ORDER BY timestamp ASC, rowid ASC"
         ).fetchall()
+
+
+def redact_event_payload(record_id: str, field_keys: List[str]) -> Optional[sqlite3.Row]:
+    """Replace the given top-level payload keys with "[REDACTED]" for one event.
+
+    This is the one deliberate exception to "append-only, no in-place
+    edits": it overwrites `payload` and sets `is_redacted = 1`, but
+    leaves `payload_hash` and `record_hash` untouched, so `GET
+    /audit/verify` keeps validating the chain after redaction (see
+    crypto_utils.py). Keys not present in the payload are ignored.
+    Returns the updated row, or None if `record_id` does not exist.
+    """
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM audit_events WHERE id = ?", (record_id,)).fetchone()
+        if row is None:
+            return None
+
+        payload = json.loads(row["payload"])
+        for key in field_keys:
+            if key in payload:
+                payload[key] = "[REDACTED]"
+
+        conn.execute(
+            "UPDATE audit_events SET payload = ?, is_redacted = 1 WHERE id = ?",
+            (json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str), record_id),
+        )
+        conn.commit()
+        return conn.execute("SELECT * FROM audit_events WHERE id = ?", (record_id,)).fetchone()
+
+
+def archive_events_older_than(days: int) -> Dict[str, Any]:
+    """Mark every non-archived event older than `days` days as archived.
+
+    Archiving is a soft flag, not a delete: archived records remain
+    fully queryable and verifiable, preserving the append-only
+    guarantee. Returns the cutoff/archived_at timestamps this call used
+    and the number of rows newly archived, so a caller never has to
+    recompute "now" itself and risk a slightly different timestamp
+    than what was actually written.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    archived_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE audit_events SET is_archived = 1, archived_at = ? "
+            "WHERE timestamp < ? AND is_archived = 0",
+            (archived_at, cutoff),
+        )
+        conn.commit()
+        archived_count = cursor.rowcount
+
+    return {
+        "cutoff_timestamp": cutoff,
+        "archived_at": archived_at,
+        "archived_count": archived_count,
+    }
+
+
+def export_events_by_target(
+    actor_id: Optional[str] = None, resource_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Return every event matching `actor_id`/`resource_id`, oldest first, plus
+    the chain hashes bounding that subset within the full log.
+
+    The "bounding hashes" are the first matched record's `prev_hash`
+    and the last matched record's `record_hash` -- the entry and exit
+    points of this subset within the overall chain. They let a
+    recipient anchor a partial export against the full log's structure
+    without needing every record in between.
+    """
+    clauses: List[str] = []
+    params: List[Any] = []
+    if actor_id is not None:
+        clauses.append("actor_id = ?")
+        params.append(actor_id)
+    if resource_id is not None:
+        clauses.append("resource_id = ?")
+        params.append(resource_id)
+
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = f"SELECT *, rowid FROM audit_events {where_sql} ORDER BY timestamp ASC, rowid ASC"
+
+    with get_connection() as conn:
+        records = conn.execute(sql, params).fetchall()
+
+    return {
+        "records": records,
+        "bounding_start_hash": records[0]["prev_hash"] if records else None,
+        "bounding_end_hash": records[-1]["record_hash"] if records else None,
+    }

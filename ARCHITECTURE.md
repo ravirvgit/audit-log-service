@@ -168,3 +168,111 @@ violation found and stops there.
 - The table's real primary key for ordering purposes is SQLite's implicit
   `rowid`, not the public `id` (a random UUID) -- see `database.py` for why
   this matters once multiple events share the same one-second timestamp.
+
+## Scenario B: Redaction, Retention, and Export
+
+Building on the append-only log above, three more endpoints let a record's
+payload be redacted, older records be archived, and a subset of the log be
+exported for offline verification -- without ever deleting a row or
+breaking the hash chain. The full cryptographic reasoning and threat model
+are in [REDACTION_DESIGN.md](REDACTION_DESIGN.md); this section covers the
+request flow for each endpoint.
+
+### Schema additions
+
+| Column | Purpose |
+| --- | --- |
+| `payload_hash` | The original payload's hash, persisted at ingestion time rather than only ever existing inside `record_hash`. Redaction preserves this value, which is what keeps `record_hash` -- and the chain -- valid afterward. |
+| `is_redacted` | Set once any field on this record has been redacted. |
+| `is_archived` | Set once this record has been archived by the retention policy. |
+| `archived_at` | UTC timestamp of when archiving happened (`NULL` until then). |
+
+### Redaction: `POST /audit/events/{record_id}/redact`
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as main.py
+    participant DB as database.py
+    participant SQL as SQLite
+
+    C->>API: POST /audit/events/{id}/redact {fields: [...]}
+    API->>DB: redact_event_payload(id, fields)
+    DB->>SQL: SELECT * FROM audit_events WHERE id = ?
+    SQL-->>DB: current row (or none)
+    DB->>DB: replace listed keys in payload with "[REDACTED]"
+    DB->>SQL: UPDATE audit_events SET payload = ?, is_redacted = 1 WHERE id = ?
+    Note over DB,SQL: payload_hash and record_hash are NOT part of this UPDATE
+    SQL-->>DB: OK
+    DB-->>API: updated row (or None if id not found)
+    API-->>C: 200 OK RedactResponse, or 404 if not found
+```
+
+This is the one deliberate exception to "append-only, no in-place edits" --
+see [REDACTION_DESIGN.md](REDACTION_DESIGN.md) for why leaving
+`payload_hash`/`record_hash` untouched keeps the chain valid.
+
+### Retention: `POST /audit/retention/apply`
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as main.py
+    participant DB as database.py
+    participant SQL as SQLite
+
+    C->>API: POST /audit/retention/apply?days=90
+    API->>DB: archive_events_older_than(days)
+    DB->>DB: cutoff = now - days, archived_at = now
+    DB->>SQL: UPDATE audit_events SET is_archived = 1, archived_at = ? WHERE timestamp < ? AND is_archived = 0
+    SQL-->>DB: rows updated
+    DB-->>API: cutoff_timestamp, archived_at, archived_count
+    API-->>C: 200 OK RetentionApplyResponse
+```
+
+Archiving never deletes a row: archived records stay fully queryable via
+`GET /audit/events` and are still walked by `GET /audit/verify`.
+
+### Export: `GET /audit/export`
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as main.py
+    participant DB as database.py
+    participant SQL as SQLite
+
+    C->>API: GET /audit/export?actor_id=...&resource_id=...
+    API->>DB: export_events_by_target(actor_id, resource_id)
+    DB->>SQL: SELECT ... WHERE filters ORDER BY timestamp ASC, rowid ASC
+    SQL-->>DB: matching rows
+    DB-->>API: records, bounding_start_hash, bounding_end_hash
+    API->>API: run full-log chain verification (get_all_events_ordered)
+    Note over API: chain status covers the WHOLE log, not just this subset
+    API-->>C: 200 OK ExportBundle{records, export_metadata, verification_proof}
+```
+
+`verification_proof` carries each exported record's own
+`prev_hash`/`record_hash`/`payload_hash`, plus the subset's
+`bounding_start_hash`/`bounding_end_hash` -- the entry and exit points of
+this (possibly filtered) subset within the larger chain -- so a recipient
+can recompute and confirm each record's `record_hash` offline without
+needing the rest of the log.
+
+### Verification, refined
+
+`GET /audit/verify`'s per-record check (see the Verification path section
+above) now branches on whether a record has been redacted or archived:
+
+```mermaid
+flowchart LR
+    Flag{"is_redacted or\nis_archived?"} -->|Yes| Stored["use the stored payload_hash"]
+    Flag -->|No| Live["recompute payload_hash from\nthe live payload"]
+```
+
+Everything else -- the `record_hash` recomputation and the `prev_hash`
+chain-linkage check -- is unchanged. See
+[REDACTION_DESIGN.md](REDACTION_DESIGN.md) for exactly what this does and
+does not still catch, including the one non-obvious trade-off: this same
+exemption also applies to archived-but-not-redacted records, even though
+archiving alone never touches the payload.
