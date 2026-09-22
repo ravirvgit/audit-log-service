@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+audit_log.db
+audit_log.db-wal
+audit_log.db-shm
